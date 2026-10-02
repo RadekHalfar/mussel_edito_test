@@ -23,26 +23,10 @@ WORKDIR /app
 
 RUN mkdir -p /app/output /app/input /app/scripts
 
-# Pin to a dated CRAN snapshot (via Posit Package Manager) instead of the
-# rolling 'latest' CRAN mirror, so a rebuild months from now doesn't silently
-# pick up different package versions and change model output.
-RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','sp','paws'), repos='https://packagemanager.posit.co/cran/2024-03-15')"
-
-# --- fuzzyfis: internal compiled FIS evaluator, built into the image -------
-# Unlike the R scripts (synced from S3 at container startup), this package's
-# C++ source is baked in at BUILD time. Changing pkg/fuzzyfis/src/evalfis2.cpp
-# requires an image rebuild - there is no S3-based hot-update path for it.
-COPY pkg/fuzzyfis /tmp/fuzzyfis
-RUN R -q -e "Rcpp::compileAttributes('/tmp/fuzzyfis')" \
-    && R CMD INSTALL /tmp/fuzzyfis \
-    && rm -rf /tmp/fuzzyfis
+RUN R -q -e "install.packages(c('Rcpp','FuzzyR','raster','terra','doSNOW','foreach','iterators','sp','paws'), repos='https://cloud.r-project.org')"
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-
-RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
-    && chown -R app:app /app
-USER app
 
 ENV SCRIPT_NAME=VSC_CB2_HSM_18.R \
     S3_SCRIPTS_PREFIX=scripts \

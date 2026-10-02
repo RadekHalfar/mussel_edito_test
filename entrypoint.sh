@@ -1,22 +1,16 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 
 # ---------------------------------------------------------------------------
 # Entrypoint: syncs the S3_SCRIPTS_PREFIX folder from S3 (including PARAMS),
 # then executes SCRIPT_NAME.  All run parameters come from the PARAMS file.
 #
-# Required environment variables (all auto-injected by EDITO for a process
-# container - see docs.dive.edito.eu/articles/contribute/process-playground.html):
+# Required environment variables:
 #   SCRIPT_NAME           R script filename to run (e.g. VSC_CB2_HSM_18.R)
+#   S3_BUCKET             S3 bucket name
 #   AWS_ACCESS_KEY_ID     S3-compatible access key
 #   AWS_SECRET_ACCESS_KEY S3-compatible secret key
 #   AWS_S3_ENDPOINT       Custom S3 endpoint URL (e.g. s3.waw3-1.cloudferro.com)
-#
-# S3_BUCKET is not part of EDITO's guaranteed auto-injected set and is not
-# read as an env var at all: it is always auto-discovered below via
-# `aws s3api list-buckets`, since the injected credentials are scoped to the
-# launching user's own bucket - listing buckets with them returns exactly
-# that bucket, with no need to know the username or bucket name in advance.
 #
 # Optional environment variables (defaults set in Dockerfile):
 #   S3_SCRIPTS_PREFIX     S3 key prefix for scripts folder (default: scripts)
@@ -33,6 +27,11 @@ S3_SCRIPTS_PREFIX="${S3_SCRIPTS_PREFIX:-scripts}"
 # ---------------------------------------------------------------------------
 if [[ -z "${SCRIPT_NAME:-}" ]]; then
     echo "Error: SCRIPT_NAME is not set."
+    exit 1
+fi
+
+if [[ -z "${S3_BUCKET:-}" ]]; then
+    echo "Error: S3_BUCKET is not set."
     exit 1
 fi
 
@@ -56,27 +55,6 @@ if [[ -n "${AWS_S3_ENDPOINT:-}" ]]; then
     else
         ENDPOINT_ARG="--endpoint-url ${AWS_S3_ENDPOINT}"
     fi
-fi
-
-# ---------------------------------------------------------------------------
-# Auto-discover the S3 bucket. No bucket-name or username env var is read:
-# the credentials validated above are enough to list the caller's own
-# bucket(s).
-# ---------------------------------------------------------------------------
-echo ">>> Discovering S3 bucket via 'aws s3api list-buckets'..."
-# shellcheck disable=SC2086
-bucket_list="$(aws s3api list-buckets ${ENDPOINT_ARG} --query 'Buckets[].Name' --output text)"
-bucket_count="$(wc -w <<< "${bucket_list}")"
-
-if [[ "${bucket_count}" -eq 1 ]]; then
-    export S3_BUCKET="${bucket_list}"
-    echo ">>> Discovered S3 bucket: ${S3_BUCKET}"
-elif [[ "${bucket_count}" -gt 1 ]]; then
-    echo "Error: bucket discovery found multiple buckets (${bucket_list}); this entrypoint expects exactly one."
-    exit 1
-else
-    echo "Error: bucket discovery via 'aws s3api list-buckets' returned no buckets for the injected credentials."
-    exit 1
 fi
 
 # ---------------------------------------------------------------------------

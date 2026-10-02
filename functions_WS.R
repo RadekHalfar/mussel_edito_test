@@ -1,94 +1,61 @@
 #########################################
 ##              Functions              ##
 #########################################
+# function merge by closest date and chosen distance lat-long --------------------------------------------------------
+join_dfs <- function( df1,
+                      df2,
+                      max_dist){
+# merge by dplyr
+joined_dfs <- df1 %>%
+  left_join(df2, by = c("date")) 
 
-# Unused/legacy helper functions have been moved to functions_WS_legacy.R
-# (not sourced by the pipeline, not uploaded to the S3 scripts/ prefix).
+#subset to only get same dates
+joined_dfs <- subset(joined_dfs, date == date & date == date)
+joined_dfs <- joined_dfs[!is.na(joined_dfs$long.x),]
+joined_dfs <- joined_dfs[!is.na(joined_dfs$long.y),]
 
-# function to change NA to -9999 to work in fuzzy logic. -9999 must match
-# evalfis_cpp2()'s na_sentinel default (pkg/fuzzyfis/src/evalfis2.cpp) - that
-# function recognizes this exact value as "missing" independent of each
-# variable's configured range, so this sentinel and that default must stay
-# in sync if either one is ever changed.
-fun9999 <- function(x) { x[is.na(x)] <- -9999; return(x)}
+# close distance selection
+# finding distance locations
+coord_df1 <- joined_dfs[, c("lat.x", "long.x")]
+coord_df1$long1 <- coord_df1$long.x * sin(mean(coord_df1$lat.x, na.rm = TRUE)/180*pi)
+coord_df2 <- joined_dfs[, c("lat.y", "long.y")]
+coord_df2$long1 <- coord_df2$long.y * sin(mean(coord_df2$lat.y, na.rm = TRUE)/180*pi)
 
-# CRS shared by the BPNS input layers that don't carry it in their own metadata
-BPNS_CRS <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+matches <- knnx.index(coord_df1, coord_df2, k = 1)
+matches
 
-#########################################
-##      Container-aware CPU count      ##
-#########################################
-# parallel::detectCores() reports the HOST's CPU count, not the container's
-# cgroup quota - on a resource-limited container (e.g. EDITO) this can badly
-# oversubscribe mclapply workers versus what's actually available, risking
-# thrashing/OOM. These helpers read the cgroup CPU quota when present so the
-# worker count reflects what the container actually has.
+dist <- distHaversine(joined_dfs[, c("long.x", "lat.x")], joined_dfs[, c("long.y", "lat.y")])
 
-# Returns an integer core limit from the cgroup CPU quota, or NA_integer_ if
-# no limit is set/readable (e.g. not running under cgroups, or unlimited).
-get_container_cpu_limit <- function() {
-  # cgroup v2: single file "<quota> <period>", quota "max" means unlimited
-  path_v2 <- "/sys/fs/cgroup/cpu.max"
-  if (file.exists(path_v2)) {
-    line <- tryCatch(readLines(path_v2, n = 1, warn = FALSE), error = function(e) NA_character_)
-    if (length(line) == 1 && !is.na(line)) {
-      parts <- strsplit(trimws(line), "\\s+")[[1]]
-      if (length(parts) == 2 && parts[1] != "max") {
-        quota <- suppressWarnings(as.numeric(parts[1]))
-        period <- suppressWarnings(as.numeric(parts[2]))
-        if (!is.na(quota) && !is.na(period) && period > 0) {
-          return(max(1L, as.integer(floor(quota / period))))
-        }
-      }
-    }
-  }
+# remove observation where distance is too big
+short_dist <- which(dist < max_dist)
+joined_dfs2 <- joined_dfs[short_dist ,]
+joined_dfs2$dist <- dist[short_dist]
 
-  # cgroup v1: quota/period in separate files; quota -1 means unlimited
-  quota_path  <- "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
-  period_path <- "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
-  if (file.exists(quota_path) && file.exists(period_path)) {
-    quota  <- suppressWarnings(as.numeric(tryCatch(readLines(quota_path, n = 1, warn = FALSE), error = function(e) NA)))
-    period <- suppressWarnings(as.numeric(tryCatch(readLines(period_path, n = 1, warn = FALSE), error = function(e) NA)))
-    if (!is.na(quota) && quota > 0 && !is.na(period) && period > 0) {
-      return(max(1L, as.integer(floor(quota / period))))
-    }
-  }
-
-  NA_integer_
+return(joined_dfs2)
 }
 
-# Resolves the worker count to use: an explicit override always wins;
-# otherwise host cores capped by the cgroup limit (if any), minus one,
-# floored at 1.
-resolve_worker_count <- function(override = NA_integer_) {
-  if (!is.na(override) && override > 0) {
-    return(as.integer(override))
-  }
-  host_cores <- parallel::detectCores()
-  cgroup_limit <- get_container_cpu_limit()
-  n <- if (!is.na(cgroup_limit)) min(host_cores, cgroup_limit) else host_cores
-  max(1L, as.integer(n) - 1L)
-}
 
-food_for_HSM <- function(folder, months = 1:12) { # create this functions to load BPNS maps
+fun9999 <- function(x) { x[is.na(x)] <- -9999; return(x)} # function to change NA to -9999 to work in fuzzy logic
 
-  for (i in months) {
-    BPNS_sst <- raster(file.path(folder, sprintf("BPNS_%d_1.tif", i)))
-    BPNS_sss <- raster(file.path(folder, sprintf("BPNS_%d_2.tif", i)))
-    BPNS_chl <- raster(file.path(folder, sprintf("BPNS_%d_3.tif", i)))
-    BPNS_oxy <- raster(file.path(folder, sprintf("BPNS_%d_4.tif", i)))
-    BPNS_orbvel <- raster(file.path(folder, sprintf("BPNS_%d_5.tif", i)))
-    #BPNS_depth <- raster(file.path(folder, sprintf("BPNS_%d_6.tif", i)))
-    BPNS_sedrate <- raster(file.path(folder, sprintf("BPNS_%d_7.tif", i)))
-    crs(BPNS_sedrate) <- BPNS_CRS
-    BPNS_substrate <- raster(file.path(folder, sprintf("BPNS_%d_8.tif", i)))
-    crs(BPNS_substrate) <- BPNS_CRS
-    BPNS_currentvel <- raster(file.path(folder, sprintf("BPNS_%d_9.tif", i)))
-    BPNS_shear <- raster(file.path(folder, sprintf("BPNS_%d_10.tif", i)))
-    crs(BPNS_shear) <- BPNS_CRS
-
+food_for_HSM <- function(folder) { # create this functions to load BPNS maps
+  
+  for (i in 1:12) {
+    BPNS_sst <- raster(paste0(folder,"BPNS_",i,"_1.tif"))
+    BPNS_sss <- raster(paste0(folder,"BPNS_",i,"_2.tif"))
+    BPNS_chl <- raster(paste0(folder,"BPNS_",i,"_3.tif"))
+    BPNS_oxy <- raster(paste0(folder,"BPNS_",i,"_4.tif"))
+    BPNS_orbvel <- raster(paste0(folder,"BPNS_",i,"_5.tif"))
+    #BPNS_depth <- raster(paste0(folder,"BPNS_",i,"_6.tif"))
+    BPNS_sedrate <- raster(paste0(folder,"BPNS_",i,"_7.tif"))
+    crs(BPNS_sedrate) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+    BPNS_substrate <- raster(paste0(folder,"BPNS_",i,"_8.tif"))
+    crs(BPNS_substrate) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+    BPNS_currentvel <- raster(paste0(folder,"BPNS_",i,"_9.tif"))
+    BPNS_shear <- raster(paste0(folder,"BPNS_",i,"_10.tif"))
+    crs(BPNS_shear) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+    
     BPNS_1 <- addLayer(BPNS_sst,BPNS_sss,BPNS_oxy,BPNS_substrate,BPNS_sedrate,BPNS_currentvel,BPNS_orbvel,BPNS_chl,BPNS_shear)
-
+    
     names(BPNS_1) <- c('temp',
                        'sal',
                        'oxy',
@@ -100,24 +67,645 @@ food_for_HSM <- function(folder, months = 1:12) { # create this functions to loa
                        'shear')
     BPNS[[i]] <-  BPNS_1
   }
-
+  
   return(BPNS)
 }
+
+food_for_HSM_terra <- function(folder) { # create this functions to load BPNS maps
+  
+  for (i in 1:12) {
+    BPNS_sst <- terra::rast(paste0(folder,"BPNS_",i,"_1.tif"))
+    BPNS_sss <- terra::rast(paste0(folder,"BPNS_",i,"_2.tif"))
+    BPNS_chl <- terra::rast(paste0(folder,"BPNS_",i,"_3.tif"))
+    BPNS_oxy <- terra::rast(paste0(folder,"BPNS_",i,"_4.tif"))
+    BPNS_orbvel <- terra::rast(paste0(folder,"BPNS_",i,"_5.tif"))
+    #BPNS_depth <- terra::rast(paste0(folder,"BPNS_",i,"_6.tif"))
+    BPNS_sedrate <- terra::rast(paste0(folder,"BPNS_",i,"_7.tif"))
+    crs(BPNS_sedrate) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+    BPNS_substrate <- terra::rast(paste0(folder,"BPNS_",i,"_8.tif"))
+    crs(BPNS_substrate) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+    BPNS_currentvel <- terra::rast(paste0(folder,"BPNS_",i,"_9.tif"))
+    
+    
+    BPNS_1 <- list(BPNS_sst,BPNS_sss,BPNS_oxy,BPNS_substrate,BPNS_sedrate,BPNS_currentvel,BPNS_orbvel,BPNS_chl)
+    
+    names(BPNS_1) <- c('temp',
+                       'sal',
+                       'oxy',
+                       'substrate',
+                       'sedrate',
+                       'currentvel',
+                       'orbvel',
+                       'chl')
+    BPNS[[i]] <-  BPNS_1
+  }
+  
+  return(BPNS)
+}
+
+food_for_HSM_wc <- function(folder_wc) { # create this functions to load BPNS maps
+  
+  for (i in 1:12) {
+    BPNS_sss <- raster(paste0(folder_wc,"BPNS input layers max/BPNS_",i,"_2.tif"))
+    BPNS_chl <- raster(paste0(folder_wc,"BPNS input layers min/BPNS_",i,"_3.tif"))
+    BPNS_oxy <- raster(paste0(folder_wc,"BPNS input layers min/BPNS_",i,"_4.tif"))
+    BPNS_orbvel <- raster(paste0(folder_wc,"BPNS input layers max/BPNS_",i,"_5.tif"))
+    BPNS_sedrate <- raster(paste0(folder_wc,"BPNS input layers max/BPNS_",i,"_7.tif"))
+    crs(BPNS_sedrate) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+    BPNS_substrate <- raster(paste0(folder_wc,"BPNS input layers max/BPNS_",i,"_8.tif"))
+    crs(BPNS_substrate) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+    BPNS_currentvel <- raster(paste0(folder_wc,"BPNS input layers max/BPNS_",i,"_9.tif"))
+    
+    if (i %in% c(1,2,3,10,11,12)){
+      BPNS_sst<- raster(paste0(folder_wc,"BPNS input layers min/BPNS_",i,"_1.tif"))
+    } else {
+      BPNS_sst<- raster(paste0(folder_wc,"BPNS input layers max/BPNS_",i,"_1.tif"))
+    }
+    
+    BPNS_1 <- addLayer(BPNS_sst,BPNS_sss,BPNS_oxy,BPNS_substrate,BPNS_sedrate,BPNS_currentvel,BPNS_orbvel,BPNS_chl)
+    
+    
+    names(BPNS_1) <- c('temp',
+                       'sal',
+                       'oxy',
+                       'substrate',
+                       'sedrate',
+                       'currentvel',
+                       'orbvel',
+                       'chl')
+    BPNS[[i]] <-  BPNS_1
+    
+  }
+  
+  return(BPNS)
+}
+
+food_for_HSM_wc_WS <- function(folder, lookup, scenario) { # create this functions to load BPNS maps
+  BPNS <- list()
+  for (i in 1:12) {
+    BPNS_1 <- stack()
+    for(par in parameters) {
+      min_max_median <- lookup %>% 
+        filter(month == i, str_detect(parameter, par)) %>% 
+        dplyr::select(all_of(scenario)) %>%
+        pull()
+      layer_name <- lookup %>% 
+        filter(month == i, str_detect(parameter, par)) %>% 
+        dplyr::select(parameter) %>%
+        pull()
+      
+      lookup_par <- tibble(n = c(1,2,3,4,5,7,8,9,10),
+                           l = c("temp","sal","chl","oxy","orbvel","sed","sub","cur","shear"))
+
+      layer_n <- lookup_par$n[which(str_detect(lookup_par$l, par))]
+        
+      layer <- paste0(folder,"BPNS input layers ", min_max_median, "/BPNS_", i, "_", layer_n, ".tif")
+      r <- raster(layer)
+      names(r) <- layer_name
+      
+      crs(r) <- "+proj=utm +zone=33 +ellps=GRS80 +units=m +no_defs"
+      
+      BPNS_1 <- stack(BPNS_1,r)
+    }
+    
+    BPNS[[i]] <-  BPNS_1
+    
+  }
+  
+  return(BPNS)
+}
+
+hsm_calc <- function(df,j) {
+  library(raster)
+  library(FuzzyR)
+  
+  hsm <- calc(df[[j]], function(x) evalfis(x, fuzzy_model[[j]]))
+  
+  return(hsm)
+}
+
+########################################################################
+
+hsm_calc_year <- function(df,j) {
+  library(raster)
+  library(FuzzyR)
+
+  # hsm <- calc(df[[j]], function(x) evalfis(x, fuzzy_model_year))
+  hsm <- calc(df[[j]], function(x) evalfis_cpp(matrix(x, nrow = 1), fuzzy_model_year))
+  
+  return(hsm)
+}
+
+####
+# using raster and for loop
+hsm_calc_year_fuzzyR <- function(df, j) {
+  # df: list of 12 raster stacks
+  # j: month index
+  rstack <- df[[j]]                 # the multi-layer raster (stack/brick)
+  n <- ncell(rstack)                # number of cells
+  # Extract all layer values: matrix with n rows (cells) and p columns (parameters)
+  vals <- getValues(rstack)         # returns matrix if multiple layers
+  out <- numeric(n)
+
+  for (k in 1:n) {
+    x <- vals[k, ]                  # vector of the cell's parameter values
+    out[k] <- evalfis(x, fuzzy_model_year)
+    # if(k %% 5000 == 0){
+      # print(k)
+    # }
+  }
+
+  hsm <- raster(rstack)             # template
+  hsm <- setValues(hsm, out)        # assign suitability values
+  return(hsm)
+}
+
+###
 
 hsm_calc_year_cpp <- function(df, j, out_disc = 201) {
   # df: list of 12 raster stacks
   # j: month index
   rstack <- df[[j]]                 # the multi-layer raster (stack/brick)
+  n <- ncell(rstack)                # number of cells
   # Extract all layer values: matrix with n rows (cells) and p columns (parameters)
   vals <- getValues(rstack)         # returns matrix if multiple layers
-
-  # evalfis_cpp already loops over all rows internally, so evaluate the whole
-  # cell matrix in a single call instead of re-parsing the FIS per cell.
-  out <- evalfis_cpp(vals, fuzzy_model_year, out_disc)
-
+  out <- numeric(n)
+  
+  for (k in 1:n) {
+    x <- vals[k, ]                  # vector of the cell's parameter values
+    out[k] <- evalfis_cpp(matrix(x, nrow = 1), fuzzy_model_year, out_disc)
+    # if(k %% 5000 == 0){
+    #   print(k)
+    # }
+  }
+  
   hsm <- raster(rstack)             # template
   hsm <- setValues(hsm, out)        # assign suitability values
   return(hsm)
+}
+
+##########################################
+
+hsm_calc_validation <- function(df,j) {
+  library(raster)
+  library(FuzzyR)
+  
+  hsm <- calc(df, function(x) evalfis(x, fuzzy_model[[j]]))
+  
+  return(hsm)
+}
+
+sensitivity_param <- function(df,param) {
+  df2 <- df
+  
+  for (j in 1:12) {
+  df2[[j]][[param]] <- df2[[j]][[param]] * 100
+  }
+  
+  return(df2)
+}
+
+
+#########################################
+##                Data                 ##
+#########################################
+# Biotic, abiotic & hydrodynamic data (EUROBIS, EMODnet, ...)
+# function load all data from computer into R --------------------------------------------------------
+get_data_from_my_computer <- function(){
+  # OBIS for Mytilus edulis --------------------------------------------------------
+  # load data 
+  OBIS <- read.csv("C:/Users/ward.standaert/Desktop/Mussels/Data/OBIS/OccurrenceNS.csv")
+  
+  #select needed columns
+  mussel_OBIS_1 <- OBIS %>%
+    dplyr::select("decimallongitude",                   
+                  "decimallatitude",
+                  "minimumdepthinmeters",
+                  "maximumdepthinmeters",
+                  "shoredistance",
+                  "bathymetry",                        
+                  "sst",
+                  "sss",
+                  'genus',
+                  "eventdate",
+                  "year",
+                  "date_year",
+                  "month",
+                  "day"
+    )
+  
+  # rename columns
+  colnames(mussel_OBIS_1) <- c("long",
+                               "lat",
+                               "depthmin",
+                               "depthmax",
+                               "shoredistance", 
+                               "bathymetry",
+                               "sst",
+                               'sss',  
+                               "genus",
+                               "date",
+                               "date_year",
+                               "year", 
+                               "month", 
+                               "day")
+  
+  # set date in correct format
+  mussel_OBIS_1$date2 <- mussel_OBIS_1$date
+  mussel_OBIS_1$date <- as.Date(substr(mussel_OBIS_1$date,1,10))
+  
+  # subset mussel_OBIS to subtidal (depth >= 4m & < 100m) ----------------------
+  df <- mussel_OBIS_1 %>%
+    subset(bathymetry > 0)
+  # create extra column for depth
+  df$depth <- NA
+  
+  # which depth should be chosen => (1) average min-max, (2) min (when no max), (3) max (when no min), (4) bathymetry (when no min or max)
+  min <- which(!is.na(df$depthmin) & is.na(df$depthmax))
+  max <- which(!is.na(df$depthmax) & is.na(df$depthmin))
+  bath <- which(is.na(df$depth))
+  min_max <- which(!is.na(df$depthmin) & !is.na(df$depthmax))
+  
+  df$depth[min] <- df$depthmin[min]
+  df$depth[max] <- df$depthmax[max]
+  df$depth[min_max] <- (df$depthmin[min_max] + df$depthmax[min_max])/2
+  df$depth[bath] <- df$bathymetry[bath]
+  
+  mussel_OBIS <- df %>%
+    subset(depth >= 4 & depth < 100)
+  
+  
+  # EMODnet Chemistry: environmental data --------------------------------------------------------
+  # load data
+  chem <- read.csv("C:/Users/ward.standaert/Desktop/Mussels/Data/EMODnet/environment emodnet chemistry.csv", header= T)
+  
+  # select needed columns
+  chem_env <- chem %>%
+    dplyr::select(yyyy.mm.ddThh.mm.ss.sss,
+                  Longitude..degrees_east.,
+                  Latitude..degrees_north.,
+                  Depth..m.,
+                  Water.depth..m.,
+                  Water.body.salinity..per.mille.,
+                  Water.body.dissolved.oxygen.concentration..umol.l.,
+                  Water.body.chlorophyll.a..mg.m.3.,
+                  Water.body.dissolved.inorganic.carbon..umol.l.,
+                  Water.body.pH..pH.units.,
+                  ITS.90.water.temperature..degrees.C.)
+  
+  # rename columns
+  colnames(chem_env) <- c('date',
+                          "long",
+                          "lat",
+                          "depth",
+                          "depth2",
+                          "sal",
+                          "oxy",
+                          "chla",
+                          "carb",
+                          "pH",
+                          "temp")
+  
+  # set date in correct format
+  chem_env$date2 <- chem_env$date 
+  chem_env$date <- as.Date(chem_env$date, format = "%Y-%m-%dT%H:%M:%S")
+  
+  # correct the long coordinates to -180 - 180
+  chem_env$long[which(chem_env$long > 180)] <- chem_env$long[which(chem_env$long > 180)] - 360
+  
+  
+  # EMODnet information to download data via Rpackage (doesn't work for physics)--------------------------------------------------------
+  #emodnet_wfs()
+  # https://github.com/emodnet/emodnetwfs
+  # https://www.emodnet-biology.eu/blog/emodnetwfs-access-emodnet-web-feature-service-data-through-r
+  # https://emodnet.github.io/EMODnetWFS/articles/ecql_filtering.html
+  
+  
+  # EMODnet Geology - sedimentation rate --------------------------------------------------------
+  wfs_geo <- emodnet_init_wfs_client(service = "geology_seabed_substrate_maps")
+  layers <- c("sedimentation_rates")
+  
+  geo_sed_rate <- emodnet_get_layers(wfs = wfs_geo, layers = layers)
+  
+  geo_sed_rate_df <- as.data.frame(geo_sed_rate)
+  
+  
+  geo_sed_rate_df <- geo_sed_rate_df %>% 
+    dplyr::select(sedimentation_rates.sea_area,
+                  sedimentation_rates.depth,
+                  sedimentation_rates.sampling_date, 
+                  sedimentation_rates.sedimentation_rate,
+                  sedimentation_rates.latitude,
+                  sedimentation_rates.longitude,
+                  sedimentation_rates.substrate) 
+  
+  
+  geo_sed_rate_df$sedimentation_rates.sampling_date <- paste0(substr(geo_sed_rate_df$sedimentation_rates.sampling_date,1,4),"-",
+                                                              substr(geo_sed_rate_df$sedimentation_rates.sampling_date,5,6),"-",
+                                                              substr(geo_sed_rate_df$sedimentation_rates.sampling_date,7,8))
+  
+  geo_sed_rate_df$sedimentation_rates.sampling_date <- as.Date(geo_sed_rate_df$sedimentation_rates.sampling_date, format = "%Y-%d-%m")
+  geo_sed_rate_df <- geo_sed_rate_df[which(!is.na(geo_sed_rate_df$sedimentation_rates.sampling_date)),]
+  
+  colnames(geo_sed_rate_df) <- c("area", "depth", "date", "sedimentation_rate", "lat", "long", "substrate" )
+  geo_sed_rate_df$date2 <- geo_sed_rate_df$date
+  
+  
+  # EMODnet Geology - substrate --------------------------------------------------------
+  wfs_geo2 <- emodnet_init_wfs_client(service = "geology_seabed_substrate_maps")
+  layers <- c("seabed_substrate_1m")
+  
+  geo_substr <- emodnet_get_layers(wfs = wfs_geo2, layers = layers)
+  
+  geo_substr_df <- as.data.frame(geo_substr)
+  
+  
+  geo_substr_df <- geo_substr_df %>% 
+    dplyr::select(seabed_substrate_1m.scale,
+                  seabed_substrate_1m.original_scale,
+                  seabed_substrate_1m.original_grain_size, 
+                  seabed_substrate_1m.folk_7cl_txt ,
+                  seabed_substrate_1m.folk_5cl_txt,
+                  seabed_substrate_1m.folk_16cl_txt,
+                  seabed_substrate_1m.geom,
+                  seabed_substrate_1m.country) 
+  
+  colnames(geo_substr_df) <- c("scale", "original_scale", "original_grain_size", "folk_7cl_txt", "folk_5cl_txt", "folk_16cl_txt", "geom", "country" )
+  
+  # EMODnet Physics - wave height -------------------------------
+  
+  wave_height_df <- read.csv("C:/Users/ward.standaert/Desktop/Mussels/Data/EMODnet/wave height.csv", header= T)
+  wave_height_df <- wave_height_df %>%
+    subset(VTDH_in_m != -99999.990000)
+  
+  colnames(wave_height_df) <- c("date", "lat", "long", "wave_heigth")
+  wave_height_df$date <- as.Date(wave_height_df$date)
+  
+  
+  wave_height_grid <- raster("C:/Users/ward.standaert/Desktop/Mussels/Data/EMODnet/Data/hs100.tif")
+  wave_height_grid_df <-na.omit(as.data.frame(wave_height_grid, xy = TRUE))
+  colnames(wave_height_grid_df) <- c("long", "lat", "wave height")
+  
+  # EMODnet Physics - horizontal current speed -------------------------------
+  #hcsp <- read.csv("C:/Users/stevenp/OneDrive - VLIZ/Documents/stevenp/Coastbusters 2.0/Data/EMODnet/horizontal current speed.csv", header= T)[-1,]
+  
+  # rename columns
+  #colnames(hcsp) <- c('date',
+  #                    "long",
+  #                    "lat",
+  #                    "hcsp")
+  
+  # set date in correct format
+  #hcsp$date2 <- hcsp$date 
+  #hcsp$date <- as.Date(hcsp$date, format = "%Y-%m-%dT%H:%M:%S")
+  
+  # long and lat as numeric
+  #hcsp$long <- as.numeric(hcsp$long)
+  #hcsp$lat <- as.numeric(hcsp$lat)
+  
+  # correct the long coordinates to -180 - 180
+  #hcsp$long[which(hcsp$long > 180)] <- hcsp$long[which(hcsp$long > 180)] - 360
+  
+  # EMODnet Physics - horizontal current speed -------------------------------
+  # only need to load hcsp_15_22_joined as already proceessed to save time. 
+  #hcsp <- read.csv("C:/Users/stevenp/OneDrive - VLIZ/Documents/stevenp/Coastbusters 2.0/Data/EMODnet/horizontal current speed (adjusted).csv", header= T)
+  current_sp <- read.csv("C:/Users/ward.standaert/Desktop/Mussels/Data/EMODnet/hcsp_15_22_joined.csv", header= T, sep = ";")
+  
+  current_sp$date <- as.Date(current_sp$date, format = "%d/%m/%Y")
+  current_sp <- subset(current_sp,hcsp < 100)
+  
+  ##############################################################################################################
+  #   STEPS TAKEN TO MANIPULATE DATA
+  # rename columns
+  #colnames(hcsp) <- c('date',
+  #                    "lat",
+  #                    "long",
+  #                    "hcsp")
+  
+  # set date in correct format
+  #hcsp$date2 <- hcsp$date 
+  #hcsp$date <- as.Date(hcsp$date, format = "%Y-%m-%dT%H:%M:%S")
+  
+  # long and lat as numeric
+  #hcsp$long <- as.numeric(hcsp$long)
+  #hcsp$lat <- as.numeric(hcsp$lat)
+  
+  # remove latitude > 90 & latitude < -90
+  #bad_lat <- c(which(hcsp$lat > 90),which(hcsp$lat < -90))
+  #hcsp <- hcsp[-bad_lat,]
+  
+  # correct the long coordinates to -180 - 180
+  #hcsp$long[which(hcsp$long > 180)] <- hcsp$long[which(hcsp$long > 180)] - 360
+  
+  # remove "NaN" value for hcsp + hcsp as numeric
+  #hcsp <- hcsp[which(hcsp$hcsp != "NaN"),]
+  #hcsp$hcsp <- as.numeric(hcsp$hcsp)
+  
+  #write.csv(hcsp,"C:/Users/stevenp/OneDrive - VLIZ/Documents/stevenp/Coastbusters 2.0/Data/EMODnet/horizontal current speed (adjusted).csv", row.names = FALSE)
+  
+  
+  # return data -------------------------------
+  data_list <- list(mussel_OBIS, chem_env, geo_sed_rate_df, geo_substr_df, current_sp, wave_height_grid)
+  names(data_list) <- c("mussel_OBIS", "chem_env", "geo_sed_rate_df", "geo_substr_df", "current_sp", "wave_height_grid")
+  
+  print("All data retrieved")
+  
+  return(data_list)
+}
+
+create_subsets_mussels_vs_envir <- function(){
+  # create subset per environmental parameter
+  # create subtidal (depth >= 2m) mussel occurrence df (with date, long & lat) to combine with other dfs ----------------------
+  mussel_occurrence <- mussel_OBIS %>%
+    subset(!is.na(date)) %>%
+    dplyr::select(date,
+                  month,
+                  long,
+                  lat) %>%
+    na.omit()
+  
+  # Depth ----------------------
+  depth <- mussel_OBIS %>%
+    subset(!is.na(depth)) %>%
+    dplyr::select(date,
+                  month,
+                  long,
+                  lat,
+                  depth) %>%
+    na.omit()
+  
+  # Temperature ----------------------
+  temp <- mussel_OBIS %>%
+    subset(!is.na(sst)) %>%
+    dplyr::select(date,
+                  month,
+                  long,
+                  lat,
+                  sst) %>%
+    na.omit()
+  
+  # Salinity ----------------------
+  sal <- mussel_OBIS %>%
+    subset(!is.na(sss)) %>%
+    dplyr::select(date,
+                  month,
+                  long,
+                  lat,
+                  sss) %>%
+    na.omit()
+  
+  # NOT RELEVANT FOR BPNS - shore distance ---------------------- to calculate shore distance: https://rdrr.io/github/MikkoVihtakari/PlotSvalbard/man/dist2land.html
+  #shoredist <- mussel_OBIS %>%
+  #  subset(!is.na(shoredistance) & shoredistance > 0) %>%
+  #  dplyr::select(date,
+  #         month,
+  #         long,
+  #         lat,
+  #         shoredistance) %>%
+  #  na.omit()
+  
+  # chlorophyll ----------------------
+  chl_1 <- chem_env %>%
+    subset(!is.na(chla)) %>%
+    dplyr::select(date,
+                  long,
+                  lat,
+                  chla) %>%
+    na.omit()
+  
+  # merge mussel occurrence df with parameter df based on date and coordinates
+  PP <- join_dfs(mussel_occurrence, chl_1, 2000) #df1, df2, max distance between obs (in meters)
+  PP <- na.omit(PP)
+  
+  
+  # dissolved oxygen ----------------------
+  oxy_1 <- chem_env %>%
+    subset(!is.na(oxy)) %>%
+    dplyr::select(date,
+                  long,
+                  lat,
+                  oxy) %>%
+    na.omit()
+  
+  # merge mussel occurrence df with parameter df based on date and coordinates
+  oxy <- join_dfs(mussel_occurrence, oxy_1, 2000) #df1, df2, max distance between obs (in meters)
+  oxy <- na.omit(oxy)
+  
+  # sedimentation rate ----------------------
+  sed_1 <- geo_sed_rate_df %>%
+    subset(!is.na(sedimentation_rate)) %>%
+    dplyr::select(date,
+                  long,
+                  lat,
+                  sedimentation_rate) %>%
+    na.omit()
+  
+  
+  # merge mussel occurrence df with parameter df based on date and coordinates
+  sed <- join_dfs(mussel_occurrence, sed_1, 2000) #df1, df2, max distance between obs (in meters)
+  sed <- na.omit(sed)
+  
+  
+  
+  # wave height ----------------------
+  # merge mussel occurrence df with parameter df based on date and coordinates
+  mussel_occurrence_00_05 <- mussel_occurrence %>%
+    subset(date > "1999-12-31" & date < "2006-01-01")
+  
+  mussel_00_05_coord <- as.matrix(mussel_occurrence_00_05[,c("long","lat")])
+  wave_height_coord <- data.frame("long" = mussel_occurrence_00_05$long, "lat" = mussel_occurrence_00_05$lat)
+  
+  wave_height_coord$wave_height <- extract(wave_height_grid,mussel_00_05_coord)
+  
+  wave_height_coord <- na.omit(wave_height_coord)
+  wave_height1 <- mutate(wave_height_coord, xy = paste(long,"-", lat)) 
+  wave_height2 <- wave_height1 %>%
+    group_by(xy) %>%
+    summarise(long = mean(long),
+              lat = mean(lat),
+              wave_height = mean(wave_height))
+  wave_height <- as.data.frame(wave_height2[,c("long","lat","wave_height")])
+  
+  # the first df I tried didn't have matches with mussel occurence (df for 2021-2022)
+  #wave_height <- join_dfs(mussel_occurrence, wave_height_df, 2000) #df1, df2, max distance between obs (in meters)
+  #wave_height <- na.omit(wave_height)
+  
+  # horizontal current speed ---------------------- # ( already subset taken, just need to load hcsp_15_22_joined to save time. Otherwise see code below with #)
+  current_sp <- current_sp
+
+  #hcsp <- hcsp[which(hcsp$date %in% mussel_occurrence$date),]
+  #hcsp <- join_dfs(mussel_occurrence, hcsp, 2000)
+  #hcsp <- na.omit(hcsp)
+  #hcsp$long <- as.numeric(hcsp$long)
+  #hcsp$lat <- as.numeric(hcsp$lat)
+  #hcsp$hcsp <- as.numeric(hcsp$hcsp)
+  
+  #str(hcsp)
+  
+  #hcsp_70_99 <- hcsp %>%
+  #  subset(date > "1969-01-01" & date < "2000-01-01") %>%
+  #  subset(lat > -90 & lat < 90) %>%
+  #  subset(long > -181 & long < 361) %>%
+  #  subset(hcsp != -9999.99)
+  
+  #hcsp_00_04 <- hcsp %>%
+  #  subset(date > "1999-12-31" & date < "2005-01-01") %>%
+  #  subset(lat > -90 & lat < 90) %>%
+  #  subset(long > -181 & long < 361) %>%
+  #  subset(hcsp != -9999.99)
+  
+  #hcsp_04_09 <- hcsp %>%
+  #  subset(date > "2004-12-31" & date < "2010-01-01") %>%
+  #  subset(lat > -90 & lat < 90) %>%
+  #  subset(long > -181 & long < 361) %>%
+  #  subset(hcsp != -9999.99) 
+  
+  #hcsp_10_14 <- hcsp %>% 
+  #  subset(date > "2009-12-31" & date < "2015-01-01") %>%
+  #  subset(lat > -90 & lat < 90) %>%
+  #  subset(long > -181 & long < 361) %>%
+  #  subset(hcsp != -9999.99)  
+  
+  #hcsp_15_17 <- hcsp %>%
+  #  subset(date > "2014-12-31" & date < "2017-01-01") %>%
+  #  subset(lat > -90 & lat < 90) %>%
+  #  subset(long > -181 & long < 361) %>%
+  #  subset(hcsp != -9999.99)  
+  #hcsp_17_20 <- hcsp %>%
+  #  subset(date > "2016-12-31" & date < "2020-01-01") %>%
+  #  subset(lat > -90 & lat < 90) %>%
+  #  subset(long > -181 & long < 361) %>%
+  #  subset(hcsp != -9999.99)  
+  #hcsp_20_22 <- hcsp %>%
+  #  subset(date > "2019-12-31" & date < "2023-01-01") %>%
+  #  subset(lat > -90 & lat < 90) %>%
+  #  subset(long > -181 & long < 361) %>%
+  #  subset(hcsp != -9999.99)  
+  
+  #hcsp_70_99_joined <- join_dfs(mussel_occurrence, hcsp_70_99, 2000) 
+  
+  #hcsp_00_04_joined <- join_dfs(mussel_occurrence, hcsp_00_04, 2000) 
+  
+  #hcsp_04_09_joined <- join_dfs(mussel_occurrence, hcsp_04_09, 2000) 
+  
+  #hcsp_10_14_joined <- join_dfs(mussel_occurrence, hcsp_10_14, 2000) 
+  
+  # test las one, other all empty
+  
+  #hcsp_15_17_joined <- join_dfs(mussel_occurrence, hcsp_15_17, 2000) 
+  #hcsp_17_20_joined <- join_dfs(mussel_occurrence, hcsp_17_20, 2000) 
+  #hcsp_20_22_joined <- join_dfs(mussel_occurrence, hcsp_20_22, 2000) 
+  
+  #hcsp_joined <- rbind(hcsp_15_17_joined, hcsp_17_20_joined,hcsp_20_22_joined)
+  
+  # return all subsets ----------------------
+  subsets_list <- list(mussel_occurrence, temp, sal, depth, PP, oxy, wave_height, current_sp, sed) 
+  names(subsets_list) <- c("mussel_occurrence", "temp", "sal", "depth", "PP", "oxy", "wave_height", "current_sp", "sed")
+  
+  print("All data processed and ready to create response curves")
+  
+  return(subsets_list)
+  
 }
 
 #########################################
@@ -129,13 +717,13 @@ hsm_calc_year_cpp <- function(df, j, out_disc = 201) {
 build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
   # create list to store monthly fis
   fis_list <- NULL
-
+  
   # to list by month
   month <- c("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
-
+  
   # Create a fis (Fuzzy inference system)
   musselbed <- NULL # start fresh
-
+  
   musselbed <- newfis(
     'musselbed_',
     fisType = "mamdani", #sugeno uses average weight
@@ -146,7 +734,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     aggMethod = "max",
     defuzzMethod = "centroid"
   )
-
+  
   #######################
   # Add input variables #
   #######################
@@ -166,8 +754,8 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'low', 'trapmf', c(-10,-10,rc_list$sst$q[1],rc_list$sst$q[2]))
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'high', 'trapmf', c(rc_list$sst$q[3],rc_list$sst$q[4],40,40))
   }
-
-
+  
+  
   # 2.  Salinity -------------------------------------------------------------------------------------------------------------------------
   if ("sal" %in% params){
     musselbed <- addvar(
@@ -184,7 +772,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'low', 'trapmf', c(0,0,rc_list$sss$q[1],rc_list$sss$q[2]))
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'high', 'trapmf', c(rc_list$sss$q[3],rc_list$sss$q[4],45,45))
   }
-
+  
   # 3.  Dissolved Oxygen concentration ---> NOT ENOUGH DATA for monthly -------------------------------------------------------------------------------------------------------------------------
   if ("oxy" %in% params){
     musselbed <- addvar(
@@ -201,7 +789,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'low', 'trapmf', c(0,0,rc_list$oxy$q[1],rc_list$oxy$q[2]))
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'high', 'trapmf', c(rc_list$oxy$q[3],rc_list$oxy$q[4],50,50))
   }
-
+  
   # 4.  Substrate -------------------------------------------------------------------------------------------------------------------------
   if ("sub" %in% params){
     musselbed <- addvar(
@@ -218,7 +806,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'low', 'trapmf', c(0,0,rc_list$substrate$q[1],rc_list$substrate$q[2]))
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'high', 'trapmf', c(rc_list$substrate$q[2],rc_list$substrate$q[3],200,200))
   }
-
+  
   # 5.  Sedimentation rate -------------------------------------------------------------------------------------------------------------------------
   if ("sed" %in% params){
     musselbed <- addvar(
@@ -235,7 +823,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'low', 'trapmf', c(-2,-2,rc_list$sedimentation$q[1],rc_list$sedimentation$q[2])) # to adjust
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'high', 'trapmf', c(rc_list$sedimentation$q[2],rc_list$sedimentation$q[3],2,2)) # to adjust
   }
-
+  
   # 6.  Current speed -------------------------------------------------------------------------------------------------------------------------
   if ("cur" %in% params){
     musselbed <- addvar(
@@ -252,7 +840,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'low', 'trapmf', c(0,0,rc_list$current_speed$q[1],rc_list$current_speed$q[2])) # to adjust
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'high', 'trapmf', c(rc_list$current_speed$q[3],rc_list$current_speed$q[4],5,5)) # to adjust
   }
-
+  
   # 7.  Orbital velocity -------------------------------------------------------------------------------------------------------------------------
   if ("orb" %in% params){
     musselbed <- addvar(
@@ -269,7 +857,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'low', 'trapmf', c(0,0,rc_list$orb_vel$q[1],rc_list$orb_vel$q[2])) # to adjust
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'high', 'trapmf', c(rc_list$orb_vel$q[2],rc_list$orb_vel$q[3],5,5)) # to adjust
   }
-
+  
   # 8. Primary Production (PP) -------------------------------------------------------------------------------------------------------------------------
   if ("chl" %in% params){
     musselbed <- addvar(
@@ -286,8 +874,8 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'low', 'trapmf', c(0,0,rc_list$PP$q[1],rc_list$PP$q[2]))
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'high', 'trapmf', c(rc_list$PP$q[3],rc_list$PP$q[4],60,60))
   }
-
-
+  
+  
   # 9.  Shear stress -------------------------------------------------------------------------------------------------------------------------
   if ("shear" %in% params){
     musselbed <- addvar(
@@ -304,8 +892,8 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'low', 'trapmf', c(0,0,rc_list$shear$q[1],rc_list$shear$q[2])) # to adjust
     musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'high', 'trapmf', c(rc_list$shear$q[2],rc_list$shear$q[3],5,5)) # to adjust
   }
-
-
+  
+  
   ########################
   # Add output variables #
   ########################
@@ -324,7 +912,7 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
   musselbed <- addmf(musselbed, 'output', 1, 'good', 'trapmf', c(65,70,80,85))
   musselbed <- addmf(musselbed, 'output', 1, 'okay', 'trapmf', c(25,50,65,70))
   musselbed <- addmf(musselbed, 'output', 1, 'bad', 'trapmf', c(0,0,25,50))
-
+  
   ###################
   # Add fuzzy rules #
   ###################
@@ -334,20 +922,20 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
   rulelist$response <- NA # add response column
   rulelist$weight <- NA # add response column
   rulelist$and_or <- NA # add AND/OR column
-
+  
   rulelist$response[which(rowSums(rulelist[,c(1:length(params))] == 1) <  ((length(params)/100)*50))] <- 4
   rulelist$response[which(rowSums(rulelist[,c(1:length(params))] == 1) >= ((length(params)/100)*50) & rowSums(rulelist[,c(1:(length(params)-1))] == 1) < ((length(params)/100)*70))] <- 3
   rulelist$response[which(rowSums(rulelist[,c(1:length(params))] == 1) >= ((length(params)/100)*70) & rowSums(rulelist[,c(1:(length(params)-1))] == 1) < ((length(params)/100)*90))] <- 2
   rulelist$response[which(rowSums(rulelist[,c(1:length(params))] == 1) >= ((length(params)/100)*90))] <- 1
   rulelist$weight <- 0.5 # weight for rule
   rulelist$and_or <- 1 # provide AND/OR column
-
+  
   if (!is.null(spec_rules)){
     # remove unnecessary rules
     for (j in 1:length(spec_rules)){
-      p <- which(spec_rules[[j]][1:length(params)] != 0)
+      p <- which(spec_rules[[j]][1:length(params)] != 0) 
       rulelist <- rulelist[-which(rulelist[,p] == spec_rules[[j]][p]),]
-    }
+    }   
     extra_rules <-t(as.data.frame(specif_rules_month))
     colnames(extra_rules) <-  colnames(rulelist)
     rulelist2 <- rbind(rulelist,extra_rules)
@@ -355,326 +943,16 @@ build_fuzzy_logic_model_yearrc <- function(params, spec_rules) {
     rulelist2 <- rulelist
   }
   musselbed <- addrule(musselbed, as.matrix(rulelist2)) # add rules to fis
-
+  
   fis_list <- musselbed
   return(fis_list)
-}
-
-#########################################
-##      Fuzzy logic (new, v2)          ##
-#########################################
-# New, parallel implementation alongside build_fuzzy_logic_model_yearrc /
-# hsm_calc_year_cpp / evalfis_cpp above, which are left untouched as a
-# fallback/reference until the new path (this section + evalfis_cpp2 in the
-# fuzzyfis package) has been validated in production. See
-# tests/test_evalfis_cpp2.R and README.md ("Old vs. New FIS Implementation").
-
-# Default input-variable ranges, matching the values hardcoded in
-# build_fuzzy_logic_model_yearrc (several were marked "# to adjust" there -
-# now PARAMS-overridable via range_<code> keys, see VSC_CB2_HSM_18.R).
-DEFAULT_MF_RANGES <- list(
-  temp  = c(-10, 40),
-  sal   = c(0, 45),
-  oxy   = c(0, 50),
-  sub   = c(0, 200),
-  sed   = c(-2, 2),
-  cur   = c(0, 5),
-  orb   = c(0, 5),
-  chl   = c(0, 60),
-  shear = c(0, 5)
-)
-
-# Default rule-generation thresholds, matching the values hardcoded in
-# build_fuzzy_logic_model_yearrc. cutoff_bad/okay/good are fractions (0-1) of
-# parameters in the "optimal" state that determine each rule's response
-# class; weight is the flat weight applied to every generated rule.
-DEFAULT_RULE_THRESHOLDS <- list(
-  cutoff_bad  = 0.50,
-  cutoff_okay = 0.70,
-  cutoff_good = 0.90,
-  weight      = 0.5
-)
-
-build_fuzzy_logic_model_yearrc2 <- function(params, spec_rules,
-                                             ranges = DEFAULT_MF_RANGES,
-                                             rule_thresholds = DEFAULT_RULE_THRESHOLDS) {
-  # create list to store monthly fis
-  fis_list <- NULL
-
-  # to list by month
-  month <- c("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
-
-  # Create a fis (Fuzzy inference system)
-  musselbed <- NULL # start fresh
-
-  musselbed <- newfis(
-    'musselbed_',
-    fisType = "mamdani", #sugeno uses average weight
-    mfType = "t1",
-    andMethod = "prod",
-    orMethod = "max",
-    impMethod = "min",
-    aggMethod = "max",
-    defuzzMethod = "centroid"
-  )
-
-  #######################
-  # Add input variables #
-  #######################
-  # 1.  Temperature -------------------------------------------------------------------------------------------------------------------------
-  if ("temp" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "temperature",
-      seq(ranges$temp[1], ranges$temp[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'optimal', 'trapmf', rc_list$sst$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'low', 'trapmf', c(ranges$temp[1],ranges$temp[1],rc_list$sst$q[1],rc_list$sst$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "temp"), 'high', 'trapmf', c(rc_list$sst$q[3],rc_list$sst$q[4],ranges$temp[2],ranges$temp[2]))
-  }
-
-
-  # 2.  Salinity -------------------------------------------------------------------------------------------------------------------------
-  if ("sal" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "salinity",
-      seq(ranges$sal[1], ranges$sal[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'optimal', 'trapmf', rc_list$sss$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'low', 'trapmf', c(ranges$sal[1],ranges$sal[1],rc_list$sss$q[1],rc_list$sss$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sal"), 'high', 'trapmf', c(rc_list$sss$q[3],rc_list$sss$q[4],ranges$sal[2],ranges$sal[2]))
-  }
-
-  # 3.  Dissolved Oxygen concentration ---> NOT ENOUGH DATA for monthly -------------------------------------------------------------------------------------------------------------------------
-  if ("oxy" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "Oxy",
-      seq(ranges$oxy[1], ranges$oxy[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'optimal', 'trapmf', rc_list$oxy$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'low', 'trapmf', c(ranges$oxy[1],ranges$oxy[1],rc_list$oxy$q[1],rc_list$oxy$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "oxy"), 'high', 'trapmf', c(rc_list$oxy$q[3],rc_list$oxy$q[4],ranges$oxy[2],ranges$oxy[2]))
-  }
-
-  # 4.  Substrate -------------------------------------------------------------------------------------------------------------------------
-  if ("sub" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "substrate",
-      seq(ranges$sub[1], ranges$sub[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'optimal', 'trimf', rc_list$substrate$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'low', 'trapmf', c(ranges$sub[1],ranges$sub[1],rc_list$substrate$q[1],rc_list$substrate$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sub"), 'high', 'trapmf', c(rc_list$substrate$q[2],rc_list$substrate$q[3],ranges$sub[2],ranges$sub[2]))
-  }
-
-  # 5.  Sedimentation rate -------------------------------------------------------------------------------------------------------------------------
-  if ("sed" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "sedimentation",
-      seq(ranges$sed[1], ranges$sed[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'optimal', 'trimf', rc_list$sedimentation$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'low', 'trapmf', c(ranges$sed[1],ranges$sed[1],rc_list$sedimentation$q[1],rc_list$sedimentation$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "sed"), 'high', 'trapmf', c(rc_list$sedimentation$q[2],rc_list$sedimentation$q[3],ranges$sed[2],ranges$sed[2]))
-  }
-
-  # 6.  Current speed -------------------------------------------------------------------------------------------------------------------------
-  if ("cur" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "current speed",
-      seq(ranges$cur[1], ranges$cur[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'optimal', 'trapmf', rc_list$current_speed$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'low', 'trapmf', c(ranges$cur[1],ranges$cur[1],rc_list$current_speed$q[1],rc_list$current_speed$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "cur"), 'high', 'trapmf', c(rc_list$current_speed$q[3],rc_list$current_speed$q[4],ranges$cur[2],ranges$cur[2]))
-  }
-
-  # 7.  Orbital velocity -------------------------------------------------------------------------------------------------------------------------
-  if ("orb" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "orbital velocity",
-      seq(ranges$orb[1], ranges$orb[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'optimal', 'trimf', rc_list$orb_vel$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'low', 'trapmf', c(ranges$orb[1],ranges$orb[1],rc_list$orb_vel$q[1],rc_list$orb_vel$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "orb"), 'high', 'trapmf', c(rc_list$orb_vel$q[2],rc_list$orb_vel$q[3],ranges$orb[2],ranges$orb[2]))
-  }
-
-  # 8. Primary Production (PP) -------------------------------------------------------------------------------------------------------------------------
-  if ("chl" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "PP",
-      seq(ranges$chl[1], ranges$chl[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'optimal', 'trapmf', rc_list$PP$q)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'low', 'trapmf', c(ranges$chl[1],ranges$chl[1],rc_list$PP$q[1],rc_list$PP$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "chl"), 'high', 'trapmf', c(rc_list$PP$q[3],rc_list$PP$q[4],ranges$chl[2],ranges$chl[2]))
-  }
-
-
-  # 9.  Shear stress -------------------------------------------------------------------------------------------------------------------------
-  if ("shear" %in% params){
-    musselbed <- addvar(
-      musselbed,
-      'input', #input or output
-      "shear stress",
-      seq(ranges$shear[1], ranges$shear[2]),
-      method = NULL,
-      params = NULL,
-      firing.method = "tnorm.min.max"
-    )
-    # Add membership function (mf)
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'optimal', 'trimf', rc_list$shear$q) # N/m² : from Smile Consult in German Bight
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'low', 'trapmf', c(ranges$shear[1],ranges$shear[1],rc_list$shear$q[1],rc_list$shear$q[2]))
-    musselbed <- addmf(musselbed, 'input', which(parameters %in% "shear"), 'high', 'trapmf', c(rc_list$shear$q[2],rc_list$shear$q[3],ranges$shear[2],ranges$shear[2]))
-  }
-
-
-  ########################
-  # Add output variables #
-  ########################
-  # 1.  Suitability -------------------------------------------------------------------------------------------------------------------------
-  # Output scale/breakpoints are NOT parameterized - they define the model's
-  # output scale itself, not an input calibration knob.
-  musselbed <- addvar(
-    musselbed,
-    'output', #input or output
-    "Suitability",
-    c(0:100),
-    method = NULL,
-    params = NULL,
-    firing.method = "tnorm.min.max"
-  )
-  # Add membership function (mf)
-  musselbed <- addmf(musselbed, 'output', 1, 'optimal', 'trapmf', c(80,85,100,100))
-  musselbed <- addmf(musselbed, 'output', 1, 'good', 'trapmf', c(65,70,80,85))
-  musselbed <- addmf(musselbed, 'output', 1, 'okay', 'trapmf', c(25,50,65,70))
-  musselbed <- addmf(musselbed, 'output', 1, 'bad', 'trapmf', c(0,0,25,50))
-
-  ###################
-  # Add fuzzy rules #
-  ###################
-  # load monthly fuzzy rules -------------------------------------------------------------------------------------------------------------------------
-  rulelist <- expand.grid(c(rep(list(c(1:3)), length(params)))) #use combinations to have all possible scenario's
-  rulelist <- as.data.frame(sapply(rulelist, function(x) as.numeric(x)))
-  rulelist$response <- NA # add response column
-  rulelist$weight <- NA # add response column
-  rulelist$and_or <- NA # add AND/OR column
-
-  frac_optimal <- rowSums(rulelist[,c(1:length(params))] == 1) / length(params)
-  # NOTE: the original build_fuzzy_logic_model_yearrc computed the upper
-  # bound of the middle two bands (okay/good) over columns
-  # 1:(length(params)-1) instead of 1:length(params) - one column short of
-  # what the lower bound uses. That looks like a copy/paste bug, but it is
-  # reproduced here EXACTLY (via frac_optimal_upper below) so this function's
-  # default output matches the old function's output bit-for-bit. Fixing it
-  # is a separate, deliberate follow-up - not part of this refactor.
-  frac_optimal_upper <- rowSums(rulelist[,c(1:(length(params)-1))] == 1) / length(params)
-  rulelist$response[which(frac_optimal <  rule_thresholds$cutoff_bad)] <- 4
-  rulelist$response[which(frac_optimal >= rule_thresholds$cutoff_bad  & frac_optimal_upper < rule_thresholds$cutoff_okay)] <- 3
-  rulelist$response[which(frac_optimal >= rule_thresholds$cutoff_okay & frac_optimal_upper < rule_thresholds$cutoff_good)] <- 2
-  rulelist$response[which(frac_optimal >= rule_thresholds$cutoff_good)] <- 1
-  rulelist$weight <- rule_thresholds$weight # weight for rule
-  rulelist$and_or <- 1 # provide AND/OR column
-
-  if (!is.null(spec_rules)){
-    # remove unnecessary rules
-    for (j in 1:length(spec_rules)){
-      p <- which(spec_rules[[j]][1:length(params)] != 0)
-      rulelist <- rulelist[-which(rulelist[,p] == spec_rules[[j]][p]),]
-    }
-    # NOTE: fixed vs. the old function, which referenced an undefined global
-    # `specif_rules_month` here (dead code today since spec_rules/
-    # specif_rules_year is always NULL in production) - uses this function's
-    # own `spec_rules` parameter instead.
-    extra_rules <-t(as.data.frame(spec_rules))
-    colnames(extra_rules) <-  colnames(rulelist)
-    rulelist2 <- rbind(rulelist,extra_rules)
-  } else {
-    rulelist2 <- rulelist
-  }
-  musselbed <- addrule(musselbed, as.matrix(rulelist2)) # add rules to fis
-
-  fis_list <- musselbed
-  return(fis_list)
-}
-
-hsm_calc_year_cpp2 <- function(df, j, fis, out_disc = 301) {
-  # df: list of monthly raster stacks; j: month index
-  # fis: FuzzyR fis object (explicit parameter, unlike hsm_calc_year_cpp
-  # which reads a fuzzy_model_year global from the calling scope)
-  rstack <- df[[j]]                 # the multi-layer raster (stack/brick)
-  vals <- getValues(rstack)         # matrix: n rows (cells) x p columns (parameters)
-
-  out <- evalfis_cpp2(vals, fis, out_disc)  # from the fuzzyfis package (library(fuzzyfis))
-
-  hsm <- raster(rstack)             # template
-  hsm <- setValues(hsm, out)        # assign suitability values
-  return(hsm)
 }
 
 
 # install.packages("Rcpp")  # if needed
-#
-# Legacy evalfis_cpp is compiled lazily (call install_legacy_evalfis_cpp()),
-# not at source() time: it is unused by the production pipeline (superseded
-# by evalfis_cpp2 in the fuzzyfis package), and source()-ing this file runs
-# at the start of every single container run - compiling ~200 lines of C++
-# on every run for a function nobody calls would be pure wasted time. Kept
-# available (not deleted) as a manual reference/fallback until the new path
-# has been validated in production; tests/test_evalfis_cpp2.R calls this
-# explicitly to get the old function as its trusted-baseline comparison.
-install_legacy_evalfis_cpp <- function() {
-  library(Rcpp)
+library(Rcpp)
 
-  cppFunction('
+cppFunction('
 #include <Rcpp.h>
 using namespace Rcpp;
 
@@ -877,4 +1155,5 @@ NumericVector evalfis_cpp(NumericMatrix input, List fis, int out_disc = 201) {
   return result;
 }
 ')
-}
+
+

@@ -1,7 +1,9 @@
 # packages really needed
 library(FuzzyR)
 library(raster)
-library(fuzzyfis)
+library(terra)
+library(doSNOW)
+library(foreach)
 
 if (!requireNamespace("paws", quietly = TRUE)) {
   stop("Package 'paws' is required for S3 access. Install it with install.packages('paws').")
@@ -49,54 +51,15 @@ load_params <- function() {
     if (is.null(v) || v == "" || v == "NULL") return(default)
     as.integer(trimws(strsplit(v, ",")[[1]]))
   }
-  get_str_vec <- function(key, default = NULL) {
-    v <- raw[[key]]
-    if (is.null(v) || v == "" || v == "NULL") return(default)
-    trimws(strsplit(v, ",")[[1]])
-  }
-
-  p_parameters <- get_str_vec("parameters", default = c("temp", "sal", "oxy", "sub", "sed", "cur", "orb", "chl", "shear"))
-
-  # Per-parameter MF ranges: one range_<code> PARAMS key per entry in
-  # p_parameters, falling back to DEFAULT_MF_RANGES (functions_WS.R) so
-  # behavior is unchanged unless explicitly overridden.
-  ranges <- setNames(
-    lapply(p_parameters, function(code) {
-      get_vec(paste0("range_", code), default = DEFAULT_MF_RANGES[[code]])
-    }),
-    p_parameters
-  )
-
-  rule_thresholds <- list(
-    cutoff_bad  = as.numeric(get_str("rule_cutoff_bad",  default = "0.50")),
-    cutoff_okay = as.numeric(get_str("rule_cutoff_okay", default = "0.70")),
-    cutoff_good = as.numeric(get_str("rule_cutoff_good", default = "0.90")),
-    weight      = as.numeric(get_str("rule_weight",      default = "0.5"))
-  )
-
-  n_cores_str <- get_str("n_cores", default = "")
-  n_cores_override <- if (nzchar(n_cores_str)) as.integer(n_cores_str) else NA_integer_
 
   list(
     months_to_process = get_vec("months_to_process", default = 1:12),
     rc_list_s3_key    = get_str("rc_list_s3_key",    default = ""),
-    bpns_s3_prefix    = get_str("bpns_s3_prefix",    default = ""),
-    out_disc          = as.integer(get_str("out_disc", default = "301")),
-    parameters        = p_parameters,
-    ranges            = ranges,
-    rule_thresholds   = rule_thresholds,
-    n_cores           = n_cores_override
+    bpns_s3_prefix    = get_str("bpns_s3_prefix",    default = "")
   )
 }
 
 p <- load_params()
-
-if (anyNA(p$months_to_process) || any(!(p$months_to_process %in% 1:12))) {
-  stop(sprintf(
-    "Invalid 'months_to_process' in PARAMS file: %s (must be integers 1-12)",
-    paste(p$months_to_process, collapse = ",")
-  ))
-}
 
 # Simple timing helpers for section-level runtime reporting
 timings <- data.frame(section = character(), seconds = numeric(), stringsAsFactors = FALSE)
@@ -162,9 +125,9 @@ ensure_rc_list_available <- function(path) {
   FALSE
 }
 
-ensure_bpns_inputs_available <- function(dir_path, months) {
+ensure_bpns_inputs_available <- function(dir_path) {
   expected_layers <- c(1, 2, 3, 4, 5, 7, 8, 9, 10)
-  expected_files <- as.vector(outer(months, expected_layers, function(m, l) sprintf("BPNS_%d_%d.tif", m, l)))
+  expected_files <- as.vector(outer(1:12, expected_layers, function(m, l) sprintf("BPNS_%d_%d.tif", m, l)))
 
   missing <- expected_files[!file.exists(file.path(dir_path, expected_files))]
   if (length(missing) == 0) {
@@ -204,7 +167,7 @@ t0 <- tic("Ensure required input files")
 if (!ensure_rc_list_available(rc_list_path)) {
   stop(paste("RC_LIST_PATH file not found locally or in S3:", rc_list_path))
 }
-if (!ensure_bpns_inputs_available(bpns_input_dir, months_to_process)) {
+if (!ensure_bpns_inputs_available(bpns_input_dir)) {
   stop(paste("BPNS_INPUT_DIR is missing required files locally and in S3:", bpns_input_dir))
 }
 toc("Ensure required input files", t0)
@@ -219,15 +182,11 @@ toc("Load response curves", t0)
 
 # build fuzzy logic model ----------------------
 t0 <- tic("Build fuzzy logic model")
-parameters <- p$parameters
+parameters <- c("temp", "sal", "oxy", "sub", "sed", "cur", "orb", "chl", "shear")
 
 specif_rules_year <- NULL
 
-fuzzy_model_year <- build_fuzzy_logic_model_yearrc2(
-  parameters, specif_rules_year,
-  ranges = p$ranges,
-  rule_thresholds = p$rule_thresholds
-)
+fuzzy_model_year <- build_fuzzy_logic_model_yearrc(parameters, specif_rules_year)
 toc("Build fuzzy logic model", t0)
 
 # load HSM input data (raster shape)
@@ -235,7 +194,7 @@ t0 <- tic("Load and preprocess BPNS data")
 folder <- if (grepl("[/\\]$", bpns_input_dir)) bpns_input_dir else paste0(bpns_input_dir, "/")
 
 BPNS <- NULL
-BPNS <- food_for_HSM(folder, months_to_process)
+BPNS <- food_for_HSM(folder)
 
 BPNS_aggr <- NULL
 for (i in months_to_process) {
@@ -257,42 +216,29 @@ t0 <- tic("Run monthly HSM calculations")
 #   print(paste0("Processing month: ", j))
 #   results_HSM_Cpp[[j]] <- hsm_calc_year_cpp(BPNS_aggr2, j, 301)
 # }
-n_cores <- resolve_worker_count(p$n_cores)
-cgroup_limit <- get_container_cpu_limit()
-cat(sprintf(
-  ">>> Worker count: %d (host cores=%s, cgroup limit=%s, override=%s)\n",
-  n_cores,
-  parallel::detectCores(),
-  if (is.na(cgroup_limit)) "none" else cgroup_limit,
-  if (is.na(p$n_cores)) "none" else p$n_cores
-))
+n_cores <- max(1, parallel::detectCores() - 1)
+cat(">>> Worker count:", n_cores, "\n")
 results_HSM_Cpp <- if (.Platform$OS.type == "windows") {
   lapply(months_to_process, function(j) {
     cat("Processing month:", j, "\n")
-    hsm_calc_year_cpp2(BPNS_aggr2, j, fuzzy_model_year, p$out_disc)
+    hsm_calc_year_cpp(BPNS_aggr2, j, 301)
   })
 } else {
   parallel::mclapply(months_to_process, function(j) {
     cat("Processing month:", j, "\n")
-    hsm_calc_year_cpp2(BPNS_aggr2, j, fuzzy_model_year, p$out_disc)
+    hsm_calc_year_cpp(BPNS_aggr2, j, 301)
   }, mc.cores = n_cores)
 }
 names(results_HSM_Cpp) <- as.character(months_to_process)
-
-# mclapply returns a try-error object per element on worker failure instead of
-# raising, so failures must be checked explicitly before writing output.
-failed <- months_to_process[vapply(results_HSM_Cpp, function(x) inherits(x, "try-error"), logical(1))]
-if (length(failed) > 0) {
-  stop(sprintf("HSM calculation failed for month(s): %s", paste(failed, collapse = ", ")))
-}
 toc("Run monthly HSM calculations", t0)
 
 t0 <- tic("Write raster outputs")
 for (i in months_to_process) {
+# for (i in 1) {
   if (!dir.exists(output_dir)) {
     dir.create(output_dir, recursive = TRUE)
   }
-  writeRaster(results_HSM_Cpp[[as.character(i)]], filename = file.path(output_dir, paste0("BPNS_", i, ".tif")),
+  writeRaster(results_HSM_Cpp[[i]], filename = file.path(output_dir, paste0("BPNS_", i, ".tif")),
               format = "GTiff", overwrite = TRUE)
 }
 toc("Write raster outputs", t0)
